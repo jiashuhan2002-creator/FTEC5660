@@ -48,6 +48,106 @@ DeepSeek Flash model. JPEG, PNG, GIF, and WebP inputs are accepted by the
 homework runner.
 
 
-## Homework 1 solution: 
-> to students: please fill your solution description here.
+## Homework 1 solution
+
+### Approach in one sentence
+
+Each receipt image is sent individually to the vision model only to **extract
+structured fields** as JSON; all arithmetic (per-receipt subtotals and the two
+final totals) is done in Python with `Decimal`, so the model never does math
+and the only uncertainty is OCR.
+
+### Chain design (`build_chain`)
+
+- **Model:** `ChatDeepSeek(model_name="deepseek-v4-flash-vision-exp",
+  api_base="https://api.deepseek.com", temperature=0)` — the required vision
+  Flash model via DeepSeek's OpenAI-compatible endpoint, temperature 0 for
+  stable extraction.
+- **Chain:** a `ChatPromptTemplate` with a strict *system* message that forces
+  the model to reply with **only** a JSON object (no prose, no code fences) and
+  a *human* multimodal message that carries the receipt image as a data URL
+  (via the provided `image_data_url` helper). The chain is a single
+  `model | parser` step — no routing or reflection was needed because a
+  well-constrained extraction prompt is already reliable.
+
+### Field schema (per receipt)
+
+```json
+{
+  "subtotal":   <the SUBTOTAL line, after discounts, before rounding>,
+  "amount_paid":<the final payment line, AFTER rounding — Octopus/cash/card>,
+  "rounding":   <the ROUNDING line, used only for sanity checks>,
+  "discounts":  [<absolute values of every promotion/coupon/member/app/
+                 packaging-damage/percentage discount line>]
+}
+```
+
+### Query logic (`answer_queries`)
+
+For each receipt the chain is invoked; the returned JSON is cleaned (strip
+`$`, `,`, `HK`) and parsed into `Decimal`. Then:
+
+- **Q1 (total spent)** = Σ over receipts of `amount_paid`
+  (the final payment *after* the rounding line).
+- **Q2 (without discount)** = Σ over receipts of `subtotal + Σ(discounts)`.
+  Rounding is **never** added back, matching the homework definition.
+
+Both totals are formatted as `HK$X.XX`, each response containing exactly one
+number as required by the grader's `parse_single_amount`.
+
+### Reliability techniques
+
+- **Self-consistency:** each image is run `N_VOTES=3` times in parallel via
+  `chain.batch`. The `subtotal`/`amount_paid` pair is reduced by majority vote;
+  the discount list is reduced by per-slot median. A disagreement triggers one
+  extra run. This cancels occasional OCR slips on individual receipts.
+- **Retries:** JSON parse failures are retried up to `MAX_RETRIES` times before
+  falling back to a zero-field record (so one bad image never aborts the run).
+- **Deterministic math:** all sums use `Decimal` to avoid float drift, and Q2's
+  "add back every discount, never add back rounding" rule is encoded directly in
+  code rather than asked of the model.
+- **No hard-coding:** no filenames or public answers appear anywhere; the
+  chain answers purely from image content, so it generalises to unseen receipt
+  folders used for grading.
+
+### Reproducibility
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+echo "DEEPSEEK_API_KEY=sk-your-key" > .env   # .env is gitignored
+python3 hw1.py --image-folder public_test
+cat results.csv
+```
+
+Expected on `public_test` (see `public_test/ground_truth.json`):
+
+```
+query,model_response,correctness
+How much money did I spend in total for these bills?,HK$1974.30,correct
+How much would I have had to pay without the discount?,HK$2348.20,correct
+```
+
+### Pipeline diagram
+
+```
+ receipt_i.png
+       │  image_data_url()
+       ▼
+ ┌───────────────────────────────────────────┐
+ │  build_chain()                            │
+ │  system: "reply JSON only, fields below"  │
+ │  human : [image data URL]                 │
+ │  model  : deepseek-v4-flash-vision-exp    │
+ └───────────────────────────────────────────┘
+       │  ×3 parallel (self-consistency)
+       ▼
+   {subtotal, amount_paid, rounding, discounts[]}
+       │  majority vote + median
+       ▼
+   per-receipt Decimal fields
+       │
+       ├──► Q1 = Σ amount_paid           ──► "HK$1974.30"
+       └──► Q2 = Σ(subtotal + Σdiscounts) ──► "HK$2348.20"
+```
 
