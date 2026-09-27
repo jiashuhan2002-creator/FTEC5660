@@ -29,13 +29,13 @@ MAX_RETRIES = 2       # 若某张一次都没解析出 JSON，再补跑几轮
 SYSTEM_PROMPT = """You are a precise OCR engine for Hong Kong supermarket receipts.
 Read the receipt image and return STRICT JSON only (no markdown, no prose, no code fences):
 
-{
+{{
   "subtotal": <number, the SUBTOTAL line: after all discounts, before ROUNDING>,
   "amount_paid": <number, the final amount actually paid: the payment-method line
                  (OCTOPUS / CASH / EPS / CARD / etc.), taken AFTER any ROUNDING>,
   "rounding": <number, the ROUNDING line (negative if it reduced the total); 0 if absent>,
   "discounts": [<number>, ...]
-}
+}}
 
 Rules:
 - Output ONLY the JSON object. Nothing else.
@@ -144,7 +144,7 @@ def build_chain() -> Any:
         api_key=api_key,
         api_base=API_BASE,
         temperature=0.0,
-        max_tokens=512,
+        max_tokens=4096,
     )
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
@@ -182,7 +182,11 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     # 按"属于哪张小票"归组、解析
     grouped: dict[int, list[dict]] = defaultdict(list)
     for i, r in zip(owner, raws):
-        p = _parse_receipt_json(response_text(r))         # response_text 模板已提供
+        _txt = response_text(r)                                  # 优先取 content
+        if not _txt:                                             # 推理模型 content 可能空，兜底取 reasoning_content
+            _ak = getattr(r, "additional_kwargs", {}) or {}
+            _txt = _ak.get("reasoning_content", "") or ""
+        p = _parse_receipt_json(_txt)
         if p is not None:
             grouped[i].append(p)
 
