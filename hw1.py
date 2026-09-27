@@ -23,28 +23,20 @@ from langchain_deepseek import ChatDeepSeek
 # ---- HW1 solution: config, prompt, helpers --------------------------------
 MODEL_NAME = "deepseek-v4-flash-vision-exp"   # 题目指定骨干模型
 API_BASE = "https://api.deepseek.com"          # DeepSeek 的 OpenAI 兼容端点
-N_VOTES = 3            # 自一致性投票：每张小票跑 3 次，取多数
+N_VOTES = 5            # 自一致性投票：每张小票跑 5 次，取多数（推理模型 temp=0 仍有轻微不确定性）
 MAX_RETRIES = 2       # 若某张一次都没解析出 JSON，再补跑几轮
 
-SYSTEM_PROMPT = """You are a precise OCR engine for Hong Kong supermarket receipts.
-Read the receipt image and return STRICT JSON only (no markdown, no prose, no code fences):
+SYSTEM_PROMPT = """You OCR Hong Kong supermarket receipts. Reply with STRICT JSON only (no markdown, no prose). Reason briefly.
 
 {{
-  "subtotal": <number, the SUBTOTAL line: after all discounts, before ROUNDING>,
-  "amount_paid": <number, the final amount actually paid: the payment-method line
-                 (OCTOPUS / CASH / EPS / CARD / etc.), taken AFTER any ROUNDING>,
-  "rounding": <number, the ROUNDING line (negative if it reduced the total); 0 if absent>,
-  "discounts": [<number>, ...]
+  "items_total": <sum of every item's FULL price before any discount>,
+  "subtotal": <SUBTOTAL line, after all discounts, before ROUNDING>,
+  "amount_paid": <final payment line (OCTOPUS/CASH/EPS/CARD), after ROUNDING>,
+  "rounding": <ROUNDING line, negative if it reduced the total; 0 if none>,
+  "discounts": [<every discount/promo/coupon/"-$X"/"X% OFF"/"Buy N Save"/packaging-damage/member line, each as a positive number>]
 }}
 
-Rules:
-- Output ONLY the JSON object. Nothing else.
-- All amounts are HKD as plain numbers, e.g. 102.31. No $ sign, no commas.
-- "discounts" lists EVERY discount / promotion / coupon / "-$X" / "X% OFF" line,
-  each as a POSITIVE magnitude (e.g. 5.39 for a "-$5.39" line).
-- If "rounding" or "discounts" are genuinely absent, use 0 / [] respectively.
-- subtotal and amount_paid must always be present and non-null.
-"""
+Plain HKD numbers (e.g. 102.31), no $ or commas. List EVERY discount line, do not omit any. items_total, subtotal, amount_paid are always present."""
 
 EXTRACT_TEXT = "Extract the JSON fields from this receipt image. Output JSON only."
 
@@ -65,6 +57,7 @@ def _parse_receipt_json(text: str) -> dict | None:
         return None
     try:
         return {
+            "items_total": float(data.get("items_total") or 0) or 0.0,
             "subtotal": float(data["subtotal"]),
             "amount_paid": float(data["amount_paid"]),
             "rounding": float(data.get("rounding", 0) or 0),
@@ -72,6 +65,32 @@ def _parse_receipt_json(text: str) -> dict | None:
         }
     except (KeyError, ValueError, TypeError):
         return None
+
+
+def _is_consistent(p: dict) -> bool:
+    """对账：items_total − 折扣 ≈ subtotal 且 subtotal + rounding ≈ amount_paid。"""
+    try:
+        sub = p["subtotal"]; paid = p["amount_paid"]
+        rnd = p.get("rounding", 0.0)
+        items = p.get("items_total", 0.0)
+        disc = sum(p.get("discounts", []))
+    except (KeyError, TypeError):
+        return False
+    # items_total 未提供时退化为只检查 rounding 关系
+    if items > 0 and abs((items - disc) - sub) > 0.06:
+        return False
+    if abs((sub + rnd) - paid) > 0.06:
+        return False
+    return True
+
+
+def _extract_text(r: Any) -> str:
+    """取最终文本用于解析：优先 content；推理模型 content 空时兜底取 reasoning_content。"""
+    t = response_text(r)
+    if not t:
+        ak = getattr(r, "additional_kwargs", {}) or {}
+        t = ak.get("reasoning_content", "") or ""
+    return t
 
 
 def _majority(parsed: list[dict]) -> dict:
@@ -144,7 +163,7 @@ def build_chain() -> Any:
         api_key=api_key,
         api_base=API_BASE,
         temperature=0.0,
-        max_tokens=4096,
+        max_tokens=8192,
     )
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
@@ -179,15 +198,11 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
             owner.append(i)
     raws = chain.batch(reqs)
 
-    # 按"属于哪张小票"归组、解析
+    # 按"属于哪张小票"归组、解析；只保留通过对账的一致抽取
     grouped: dict[int, list[dict]] = defaultdict(list)
     for i, r in zip(owner, raws):
-        _txt = response_text(r)                                  # 优先取 content
-        if not _txt:                                             # 推理模型 content 可能空，兜底取 reasoning_content
-            _ak = getattr(r, "additional_kwargs", {}) or {}
-            _txt = _ak.get("reasoning_content", "") or ""
-        p = _parse_receipt_json(_txt)
-        if p is not None:
+        p = _parse_receipt_json(_extract_text(r))
+        if p is not None and _is_consistent(p):
             grouped[i].append(p)
 
     total_paid = Decimal("0")
@@ -199,10 +214,17 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
         while not parsed and retries < MAX_RETRIES:
             extra = chain.batch([{"image": data_urls[i]}] * N_VOTES)
             for r in extra:
-                p = _parse_receipt_json(response_text(r))
-                if p is not None:
+                p = _parse_receipt_json(_extract_text(r))
+                if p is not None and _is_consistent(p):
                     parsed.append(p)
             retries += 1
+        if not parsed:
+            # 兜底：若对账一致性始终过不了，退而用任意能解析的结果（取第一条）
+            for r in chain.batch([{"image": data_urls[i]}] * 2):
+                p = _parse_receipt_json(_extract_text(r))
+                if p is not None:
+                    parsed.append(p)
+                    break
         if not parsed:
             raise RuntimeError(f"receipt #{i} 无法解析，请检查图片/prompt")
 
