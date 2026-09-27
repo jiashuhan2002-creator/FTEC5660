@@ -13,6 +13,79 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+import os
+from collections import Counter, defaultdict
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
+
+
+# ---- HW1 solution: config, prompt, helpers --------------------------------
+MODEL_NAME = "deepseek-v4-flash-vision-exp"   # 题目指定骨干模型
+API_BASE = "https://api.deepseek.com"          # DeepSeek 的 OpenAI 兼容端点
+N_VOTES = 3            # 自一致性投票：每张小票跑 3 次，取多数
+MAX_RETRIES = 2       # 若某张一次都没解析出 JSON，再补跑几轮
+
+SYSTEM_PROMPT = """You are a precise OCR engine for Hong Kong supermarket receipts.
+Read the receipt image and return STRICT JSON only (no markdown, no prose, no code fences):
+
+{
+  "subtotal": <number, the SUBTOTAL line: after all discounts, before ROUNDING>,
+  "amount_paid": <number, the final amount actually paid: the payment-method line
+                 (OCTOPUS / CASH / EPS / CARD / etc.), taken AFTER any ROUNDING>,
+  "rounding": <number, the ROUNDING line (negative if it reduced the total); 0 if absent>,
+  "discounts": [<number>, ...]
+}
+
+Rules:
+- Output ONLY the JSON object. Nothing else.
+- All amounts are HKD as plain numbers, e.g. 102.31. No $ sign, no commas.
+- "discounts" lists EVERY discount / promotion / coupon / "-$X" / "X% OFF" line,
+  each as a POSITIVE magnitude (e.g. 5.39 for a "-$5.39" line).
+- If "rounding" or "discounts" are genuinely absent, use 0 / [] respectively.
+- subtotal and amount_paid must always be present and non-null.
+"""
+
+EXTRACT_TEXT = "Extract the JSON fields from this receipt image. Output JSON only."
+
+
+def _parse_receipt_json(text: str) -> dict | None:
+    """容错解析：去掉 ```json 围栏、抽取第一个 {...}、校验数值字段。"""
+    s = text.strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s[:4].lower() == "json":
+            s = s[4:]
+    start, end = s.find("{"), s.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(s[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    try:
+        return {
+            "subtotal": float(data["subtotal"]),
+            "amount_paid": float(data["amount_paid"]),
+            "rounding": float(data.get("rounding", 0) or 0),
+            "discounts": [abs(float(x)) for x in data.get("discounts", [])],
+        }
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def _majority(parsed: list[dict]) -> dict:
+    """对多次抽取结果按 (subtotal, amount_paid) 取多数，折扣取该组里的中位和。"""
+    key = lambda p: (round(p["subtotal"], 2), round(p["amount_paid"], 2))
+    best = Counter(key(p) for p in parsed).most_common(1)[0][0]
+    winners = [p for p in parsed if key(p) == best]
+    n = len(winners)
+    disc_sorted = sorted(sum(w["discounts"]) for w in winners)
+    disc_med = disc_sorted[n // 2] if disc_sorted else 0.0
+    rep = winners[0]
+    rep["discounts_sum"] = disc_med
+    return rep
+
 
 QUERY_1 = "How much money did I spend in total for these bills?"
 QUERY_2 = "How much would I have had to pay without the discount?"
@@ -63,7 +136,24 @@ def build_chain() -> Any:
     ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
     """
     ### YOUR CODE HERE
-    return None
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY is not set; put it in .env")
+    model = ChatDeepSeek(
+        model_name=MODEL_NAME,
+        api_key=api_key,
+        api_base=API_BASE,
+        temperature=0.0,
+        max_tokens=512,
+    )
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", SYSTEM_PROMPT),
+        ("human", [
+            {"type": "image_url", "image_url": {"url": "{image}"}},
+            {"type": "text", "text": EXTRACT_TEXT},
+        ]),
+    ])
+    return prompt | model
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
@@ -79,8 +169,51 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     to process independent receipt-extraction prompts in parallel.
     """
     ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+    data_urls = [image_data_url(p) for p in images]      # 模板已提供此 helper
+
+    # 一次性把 N_VOTES × 张数 全部 batch 出去（并行，最快）
+    reqs, owner = [], []
+    for i, url in enumerate(data_urls):
+        for _ in range(N_VOTES):
+            reqs.append({"image": url})
+            owner.append(i)
+    raws = chain.batch(reqs)
+
+    # 按"属于哪张小票"归组、解析
+    grouped: dict[int, list[dict]] = defaultdict(list)
+    for i, r in zip(owner, raws):
+        p = _parse_receipt_json(response_text(r))         # response_text 模板已提供
+        if p is not None:
+            grouped[i].append(p)
+
+    total_paid = Decimal("0")
+    total_without_discount = Decimal("0")
+
+    for i in range(len(data_urls)):
+        parsed = grouped.get(i, [])
+        retries = 0
+        while not parsed and retries < MAX_RETRIES:
+            extra = chain.batch([{"image": data_urls[i]}] * N_VOTES)
+            for r in extra:
+                p = _parse_receipt_json(response_text(r))
+                if p is not None:
+                    parsed.append(p)
+            retries += 1
+        if not parsed:
+            raise RuntimeError(f"receipt #{i} 无法解析，请检查图片/prompt")
+
+        rec = _majority(parsed)
+        paid = Decimal(str(rec["amount_paid"]))
+        subtotal = Decimal(str(rec["subtotal"]))
+        discounts_sum = Decimal(str(rec["discounts_sum"]))
+
+        # Q1 = 最终实付(取整后)；Q2 = 小计 + 折扣加回(不加 ROUNDING)
+        total_paid += paid
+        total_without_discount += subtotal + discounts_sum
+
+    q1 = f"HK${total_paid.quantize(Decimal('0.01'))}"
+    q2 = f"HK${total_without_discount.quantize(Decimal('0.01'))}"
+    return {QUERY_1: q1, QUERY_2: q2}
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
