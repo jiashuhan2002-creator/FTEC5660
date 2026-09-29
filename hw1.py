@@ -21,10 +21,10 @@ from langchain_deepseek import ChatDeepSeek
 
 
 # ---- HW1 solution: config, prompt, helpers --------------------------------
-MODEL_NAME = "deepseek-v4-flash-vision-exp"   # 题目指定骨干模型
-API_BASE = "https://api.deepseek.com"          # DeepSeek 的 OpenAI 兼容端点
-N_VOTES = 5            # 自一致性投票：每张小票跑 5 次，取多数（推理模型 temp=0 仍有轻微不确定性）
-MAX_RETRIES = 2       # 若某张一次都没解析出 JSON，再补跑几轮
+MODEL_NAME = "deepseek-v4-flash-vision-exp"
+API_BASE = "https://api.deepseek.com"
+N_VOTES = 5
+MAX_RETRIES = 2
 
 SYSTEM_PROMPT = """You OCR Hong Kong supermarket receipts. Reply with STRICT JSON only (no markdown, no prose). Reason briefly.
 
@@ -42,7 +42,7 @@ EXTRACT_TEXT = "Extract the JSON fields from this receipt image. Output JSON onl
 
 
 def _parse_receipt_json(text: str) -> dict | None:
-    """容错解析：去掉 ```json 围栏、抽取第一个 {...}、校验数值字段。"""
+    """Tolerant JSON parse: strip ```json fences, extract the first {...}, validate numeric fields."""
     s = text.strip()
     if s.startswith("```"):
         s = s.strip("`")
@@ -68,7 +68,7 @@ def _parse_receipt_json(text: str) -> dict | None:
 
 
 def _is_consistent(p: dict) -> bool:
-    """对账：items_total − 折扣 ≈ subtotal 且 subtotal + rounding ≈ amount_paid。"""
+    """Reconcile: items_total - discounts ~= subtotal and subtotal + rounding ~= amount_paid."""
     try:
         sub = p["subtotal"]; paid = p["amount_paid"]
         rnd = p.get("rounding", 0.0)
@@ -76,7 +76,6 @@ def _is_consistent(p: dict) -> bool:
         disc = sum(p.get("discounts", []))
     except (KeyError, TypeError):
         return False
-    # items_total 未提供时退化为只检查 rounding 关系
     if items > 0 and abs((items - disc) - sub) > 0.06:
         return False
     if abs((sub + rnd) - paid) > 0.06:
@@ -85,7 +84,7 @@ def _is_consistent(p: dict) -> bool:
 
 
 def _extract_text(r: Any) -> str:
-    """取最终文本用于解析：优先 content；推理模型 content 空时兜底取 reasoning_content。"""
+    """Get text for parsing: prefer content; for reasoning models, fall back to reasoning_content."""
     t = response_text(r)
     if not t:
         ak = getattr(r, "additional_kwargs", {}) or {}
@@ -94,7 +93,7 @@ def _extract_text(r: Any) -> str:
 
 
 def _majority(parsed: list[dict]) -> dict:
-    """对多次抽取结果按 (subtotal, amount_paid) 取多数，折扣取该组里的中位和。"""
+    """Majority vote on (subtotal, amount_paid); take median discount sum among the winners."""
     key = lambda p: (round(p["subtotal"], 2), round(p["amount_paid"], 2))
     best = Counter(key(p) for p in parsed).most_common(1)[0][0]
     winners = [p for p in parsed if key(p) == best]
@@ -188,9 +187,8 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     to process independent receipt-extraction prompts in parallel.
     """
     ### YOUR CODE HERE
-    data_urls = [image_data_url(p) for p in images]      # 模板已提供此 helper
+    data_urls = [image_data_url(p) for p in images]
 
-    # 一次性把 N_VOTES × 张数 全部 batch 出去（并行，最快）
     reqs, owner = [], []
     for i, url in enumerate(data_urls):
         for _ in range(N_VOTES):
@@ -198,7 +196,6 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
             owner.append(i)
     raws = chain.batch(reqs)
 
-    # 按"属于哪张小票"归组、解析；只保留通过对账的一致抽取
     grouped: dict[int, list[dict]] = defaultdict(list)
     for i, r in zip(owner, raws):
         p = _parse_receipt_json(_extract_text(r))
@@ -219,21 +216,19 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
                     parsed.append(p)
             retries += 1
         if not parsed:
-            # 兜底：若对账一致性始终过不了，退而用任意能解析的结果（取第一条）
             for r in chain.batch([{"image": data_urls[i]}] * 2):
                 p = _parse_receipt_json(_extract_text(r))
                 if p is not None:
                     parsed.append(p)
                     break
         if not parsed:
-            raise RuntimeError(f"receipt #{i} 无法解析，请检查图片/prompt")
+            raise RuntimeError(f"receipt #{i}: could not parse JSON, check image/prompt")
 
         rec = _majority(parsed)
         paid = Decimal(str(rec["amount_paid"]))
         subtotal = Decimal(str(rec["subtotal"]))
         discounts_sum = Decimal(str(rec["discounts_sum"]))
 
-        # Q1 = 最终实付(取整后)；Q2 = 小计 + 折扣加回(不加 ROUNDING)
         total_paid += paid
         total_without_discount += subtotal + discounts_sum
 
